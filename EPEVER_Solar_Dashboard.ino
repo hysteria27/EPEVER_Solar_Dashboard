@@ -1,19 +1,15 @@
 /*
-  EPEVER MPPT Solar Charge Controller Web Dashboard V9.7 (MODULAR CONFIG)
+  EPEVER MPPT Solar Charge Controller Web Dashboard V9.8 (FIXED)
   
-  FEATURES:
-  - Added "Rated Voltage" setting field back to UI.
-  - Separated Configuration: WiFi and PIN are now in config.h
-  - Hybrid Write Protocol (0x10 -> 0x06 Fallback) for maximum compatibility.
-  - Smart Direction: Logic to handle raising/lowering voltage limits safely.
-  - Check-Before-Write: Skips writing if the parameter is already set correctly.
-  - Diagnostic Mode: Prints all voltage settings to Serial Monitor on load.
-  - Connectivity: WiFi Station Mode + AP Fallback (EPEVER_Direct).
-  - Logging: Minute-by-minute CSV logging to LittleFS.
+  FIXES:
+  - OTA Update logic corrected to prevent 404 errors.
+  - Added robust restart handling after update.
+  
+  REQUIRED:
+  - Partition Scheme: Minimal SPIFFS (1.9MB APP / 190KB SPIFFS)
 */
 
 #include <WiFi.h>
-#include <WiFiProv.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncWebSocket.h>
@@ -21,15 +17,24 @@
 #include <ModbusMaster.h>
 #include <LittleFS.h>
 #include <time.h>
+#include <Update.h>
 
 // --- INCLUDE UI & CONFIG ---
 #include "web_page.h" 
-#include "config.h" // <--- Credentials are now here
+#include "config.h"
 
 // --- AP FALLBACK ---
 const char* ap_ssid = "EPEVER_Direct";
 const char* ap_pass = "12345678";
 bool isAPMode = false;
+const char* WIFI_CONFIG_FILE = "/wifi_config.json";
+
+// --- FIRMWARE INFO ---
+const char* FIRMWARE_VERSION = "9.8.1";
+const char* FIRMWARE_DATE = "2025-11-27";
+bool otaInProgress = false;
+int otaProgress = 0;
+bool shouldReboot = false; // Flag for safe reboot
 
 // --- TIME CONFIG ---
 const char* ntpServer = "pool.ntp.org";
@@ -44,7 +49,7 @@ const int   daylightOffset_sec = 0;
 #define RS485_DE_RE_PIN 2
 
 // --- TIMING ---
-const long POLLING_INTERVAL = 2000; 
+const long POLLING_INTERVAL = 2000;
 const long MINUTE_LOG_INTERVAL = 60000;
 const long HISTORY_SAVE_INTERVAL = 600000;
 
@@ -55,7 +60,7 @@ unsigned long lastWiFiCheck = 0;
 
 // --- UPDATE FLAGS ---
 bool shouldUpdateSettings = false;
-StaticJsonDocument<2048> pendingSettings; 
+StaticJsonDocument<2048> pendingSettings;
 
 // --- OBJECTS ---
 AsyncWebServer server(80);
@@ -63,37 +68,37 @@ AsyncWebSocket ws("/ws");
 ModbusMaster node;
 
 // --- REGISTERS ---
-// Live Data (Input Registers - 0x04)
-const uint16_t REG_PV_VOLTAGE      = 0x3100; 
+// Live Data
+const uint16_t REG_PV_VOLTAGE      = 0x3100;
 const uint16_t REG_PV_CURRENT      = 0x3101; 
-const uint16_t REG_PV_POWER_L      = 0x3102; 
+const uint16_t REG_PV_POWER_L      = 0x3102;
 const uint16_t REG_BAT_VOLTAGE     = 0x3104; 
-const uint16_t REG_CHARGE_CURRENT  = 0x3105; 
+const uint16_t REG_CHARGE_CURRENT  = 0x3105;
 const uint16_t REG_LOAD_VOLTAGE    = 0x310C; 
-const uint16_t REG_LOAD_CURRENT    = 0x310D; 
+const uint16_t REG_LOAD_CURRENT    = 0x310D;
 const uint16_t REG_LOAD_POWER_L    = 0x310E; 
-const uint16_t REG_TEMP_CTRL       = 0x3111; 
-const uint16_t REG_BAT_SOC         = 0x311A; 
+const uint16_t REG_TEMP_CTRL       = 0x3111;
+const uint16_t REG_BAT_SOC         = 0x311A;
 const uint16_t REG_STATUS          = 0x3201; 
 const uint16_t REG_DAILY_ENERGY_L  = 0x330C;
 
-// Settings (Holding Registers - 0x03/0x06/0x10)
-const uint16_t REG_SET_BAT_TYPE    = 0x9000; 
+// Settings
+const uint16_t REG_SET_BAT_TYPE    = 0x9000;
 const uint16_t REG_SET_BAT_CAP     = 0x9001; 
-const uint16_t REG_SET_TEMP_COMP   = 0x9002; 
-const uint16_t REG_SET_OVD         = 0x9003; 
-const uint16_t REG_SET_CLV         = 0x9004; 
-const uint16_t REG_SET_OVR         = 0x9005; 
-const uint16_t REG_SET_EQV         = 0x9006; 
-const uint16_t REG_SET_BST         = 0x9007; 
-const uint16_t REG_SET_FLT         = 0x9008; 
-const uint16_t REG_SET_BSR         = 0x9009; 
-const uint16_t REG_SET_LVR         = 0x900A; 
-const uint16_t REG_SET_UVR         = 0x900B; 
-const uint16_t REG_SET_UVW         = 0x900C; 
-const uint16_t REG_SET_LVD         = 0x900D; 
+const uint16_t REG_SET_TEMP_COMP   = 0x9002;
+const uint16_t REG_SET_OVD         = 0x9003;
+const uint16_t REG_SET_CLV         = 0x9004;
+const uint16_t REG_SET_OVR         = 0x9005;
+const uint16_t REG_SET_EQV         = 0x9006;
+const uint16_t REG_SET_BST         = 0x9007;
+const uint16_t REG_SET_FLT         = 0x9008;
+const uint16_t REG_SET_BSR         = 0x9009;
+const uint16_t REG_SET_LVR         = 0x900A;
+const uint16_t REG_SET_UVR         = 0x900B;
+const uint16_t REG_SET_UVW         = 0x900C;
+const uint16_t REG_SET_LVD         = 0x900D;
 const uint16_t REG_SET_DLV         = 0x900E; 
-const uint16_t REG_SET_RATED_VOLT  = 0x9067; 
+const uint16_t REG_SET_RATED_VOLT  = 0x9067;
 const uint16_t REG_SET_EQ_TIME     = 0x906B;
 const uint16_t REG_SET_BST_TIME    = 0x906C;
 
@@ -105,10 +110,11 @@ struct EpeverData {
 };
 
 struct EpeverSettings {
-  uint16_t batType; uint16_t batCap; uint16_t tempComp;
-  uint16_t ratedVolt; // ADDED
-  float ovd; float clv; float ovr; float eqv; float bst; float flt;
-  float bsr; float lvr; float uvr; float uvw; float lvd; float dlv;
+  uint16_t batType;
+  uint16_t batCap; uint16_t tempComp;
+  uint16_t ratedVolt;
+  float ovd; float clv; float ovr; float eqv; float bst;
+  float flt; float bsr; float lvr; float uvr; float uvw; float lvd; float dlv;
   uint16_t eqTime; uint16_t bstTime;
   bool valid;
 };
@@ -118,16 +124,8 @@ EpeverSettings currentSettings;
 
 const char* HISTORY_FILE = "/history.json";
 
-void preTransmission() { 
-  delay(2); 
-  digitalWrite(RS485_DE_RE_PIN, HIGH); 
-  delay(2);
-}
-void postTransmission() { 
-  delay(2);
-  digitalWrite(RS485_DE_RE_PIN, LOW); 
-  delay(2);
-}
+void preTransmission() { delay(2); digitalWrite(RS485_DE_RE_PIN, HIGH); delay(2); }
+void postTransmission() { delay(2); digitalWrite(RS485_DE_RE_PIN, LOW); delay(2); }
 
 String getCurrentDate() {
   struct tm timeinfo;
@@ -135,6 +133,7 @@ String getCurrentDate() {
   char buff[20]; strftime(buff, sizeof(buff), "%Y-%m-%d", &timeinfo);
   return String(buff);
 }
+
 String getCurrentTimeShort() {
   struct tm timeinfo;
   if(!getLocalTime(&timeinfo)) return "00:00";
@@ -145,13 +144,9 @@ String getCurrentTimeShort() {
 // Diagnostic: Verify Modbus connection to controller
 void verifyModbusConnection() {
   Serial.println("\n=== MODBUS DIAGNOSTICS ===");
-  Serial.printf("Slave ID: 0x%02X | Baud: 115200 | Pins: RX=%d TX=%d DE_RE=%d\n", 
-    MODBUS_SLAVE_ID, RX_PIN, TX_PIN, RS485_DE_RE_PIN);
-  
-  // Try to read a simple register
+  Serial.printf("Slave ID: 0x%02X | Baud: 115200 | Pins: RX=%d TX=%d DE_RE=%d\n", MODBUS_SLAVE_ID, RX_PIN, TX_PIN, RS485_DE_RE_PIN);
   Serial.print("Testing read (Status register)... ");
   uint8_t result = node.readInputRegisters(REG_STATUS, 1);
-  
   if (result == node.ku8MBSuccess) {
     Serial.printf("✓ SUCCESS - Got value: %d\n", node.getResponseBuffer(0));
     Serial.println("→ Modbus connection OK, writes should work!");
@@ -211,8 +206,6 @@ void readLiveSensors() {
 
 void readEpeverSettings() {
   uint8_t result;
-  
-  // Read Type, Cap, Temp Comp
   result = node.readHoldingRegisters(REG_SET_BAT_TYPE, 3);
   if (result == node.ku8MBSuccess) {
     currentSettings.batType = node.getResponseBuffer(0);
@@ -238,7 +231,6 @@ void readEpeverSettings() {
   } else return;
   delay(10);
 
-  // ADDED: Read Rated Voltage
   result = node.readHoldingRegisters(REG_SET_RATED_VOLT, 1);
   if (result == node.ku8MBSuccess) {
     currentSettings.ratedVolt = node.getResponseBuffer(0);
@@ -253,7 +245,7 @@ void readEpeverSettings() {
   }
 }
 
-// === HYBRID WRITE: CHECK -> TRY 0x10 -> TRY 0x06 ===
+// === HYBRID WRITE PROTOCOL ===
 const char* getModbusErrorMsg(uint8_t code) {
   switch(code) {
     case 0x01: return "Illegal Function";
@@ -268,14 +260,12 @@ const char* getModbusErrorMsg(uint8_t code) {
 }
 
 bool writeHybrid(uint16_t reg, uint16_t val, const char* name) {
-  // 1. Check if already set
   Serial.printf("[%s] Reading current value at 0x%04X... ", name, reg);
   uint8_t result = node.readHoldingRegisters(reg, 1);
   
   if (result == node.ku8MBSuccess) {
     uint16_t current = node.getResponseBuffer(0);
     Serial.printf("Current=%d\n", current);
-    
     if (current == val) {
       Serial.printf("[%s] ✓ SKIP - Already correct value\n\n", name);
       return true;
@@ -283,9 +273,8 @@ bool writeHybrid(uint16_t reg, uint16_t val, const char* name) {
   } else {
     Serial.printf("FAIL - %s (0x%02X)\n", getModbusErrorMsg(result), result);
   }
-  delay(50); 
+  delay(50);
 
-  // 2. Try FC16 (Write Multiple Registers)
   Serial.printf("[%s] Writing 0x%04X via FC16... ", name, val);
   node.setTransmitBuffer(0, val);
   result = node.writeMultipleRegisters(reg, 1);
@@ -297,12 +286,9 @@ bool writeHybrid(uint16_t reg, uint16_t val, const char* name) {
   }
   
   Serial.printf("FAIL - %s (0x%02X)\n", getModbusErrorMsg(result), result);
-  
-  // 3. Fallback FC06 (Write Single Register)
   Serial.printf("[%s] Retrying via FC06... ", name);
   delay(50);
   result = node.writeSingleRegister(reg, val);
-  
   if (result == node.ku8MBSuccess) {
     Serial.println("✓ OK (FC06)");
     delay(200);
@@ -315,31 +301,28 @@ bool writeHybrid(uint16_t reg, uint16_t val, const char* name) {
 
 // --- BACKGROUND UPDATE TASK ---
 void processSettingsUpdate() {
-  Serial.println("\n--- UPDATE V9.7 (MODULAR CONFIG) ---");
+  Serial.println("\n--- UPDATE STARTED ---");
   
-  // 1. Battery Type, Rated Volt, Temp Comp (Write these first!)
   if(pendingSettings.containsKey("type")) writeHybrid(REG_SET_BAT_TYPE, pendingSettings["type"], "Bat Type");
   if(pendingSettings.containsKey("ratedVolt")) writeHybrid(REG_SET_RATED_VOLT, pendingSettings["ratedVolt"], "Rated Volt");
   if(pendingSettings.containsKey("cap")) writeHybrid(REG_SET_BAT_CAP, pendingSettings["cap"], "Cap");
   if(pendingSettings.containsKey("tcomp")) writeHybrid(REG_SET_TEMP_COMP, pendingSettings["tcomp"], "Temp Comp");
-  
-  // 2. Determine Direction: Are we raising or lowering OVD?
-  bool raisingVoltages = true; // Default assumption
+
+  // Smart Direction Logic
+  bool raisingVoltages = true;
   uint16_t targetOVD = (uint16_t)(pendingSettings["ovd"].as<float>()*100);
   
   if (node.readHoldingRegisters(REG_SET_OVD, 1) == node.ku8MBSuccess) {
       uint16_t currentOVD = node.getResponseBuffer(0);
       if (targetOVD < currentOVD) {
-          raisingVoltages = false; // Must lower floor before lowering ceiling
+          raisingVoltages = false;
           Serial.println(">> DIRECTION: LOWERING (Bottom-Up)");
       } else {
           Serial.println(">> DIRECTION: RAISING (Top-Down)");
       }
   }
 
-  // 3. EXECUTE SMART SEQUENCE
   if (raisingVoltages) {
-      // TOP-DOWN: Raise ceiling first (OVD), then fill down to DLV
       if(pendingSettings.containsKey("ovd")) writeHybrid(REG_SET_OVD, targetOVD, "OVD");
       if(pendingSettings.containsKey("clv")) writeHybrid(REG_SET_CLV, (uint16_t)(pendingSettings["clv"].as<float>()*100), "CLV");
       if(pendingSettings.containsKey("ovr")) writeHybrid(REG_SET_OVR, (uint16_t)(pendingSettings["ovr"].as<float>()*100), "OVR");
@@ -353,7 +336,6 @@ void processSettingsUpdate() {
       if(pendingSettings.containsKey("lvd")) writeHybrid(REG_SET_LVD, (uint16_t)(pendingSettings["lvd"].as<float>()*100), "LVD");
       if(pendingSettings.containsKey("dlv")) writeHybrid(REG_SET_DLV, (uint16_t)(pendingSettings["dlv"].as<float>()*100), "DLV");
   } else {
-      // BOTTOM-UP: Lower floor first (DLV), then allow ceiling to drop
       if(pendingSettings.containsKey("dlv")) writeHybrid(REG_SET_DLV, (uint16_t)(pendingSettings["dlv"].as<float>()*100), "DLV");
       if(pendingSettings.containsKey("lvd")) writeHybrid(REG_SET_LVD, (uint16_t)(pendingSettings["lvd"].as<float>()*100), "LVD");
       if(pendingSettings.containsKey("uvw")) writeHybrid(REG_SET_UVW, (uint16_t)(pendingSettings["uvw"].as<float>()*100), "UVW");
@@ -368,20 +350,19 @@ void processSettingsUpdate() {
       if(pendingSettings.containsKey("ovd")) writeHybrid(REG_SET_OVD, targetOVD, "OVD");
   }
 
-  // 4. Durations
   if(pendingSettings.containsKey("eqt")) writeHybrid(REG_SET_EQ_TIME, pendingSettings["eqt"], "Eq Time");
   if(pendingSettings.containsKey("bstt")) writeHybrid(REG_SET_BST_TIME, pendingSettings["bstt"], "Boost Time");
-
+  
   Serial.println("--- DONE ---");
   shouldUpdateSettings = false;
 }
 
 // --- LOGGING ---
 void updateDailySummary() {
-  if (!liveData.valid || isAPMode) return; 
+  if (!liveData.valid || isAPMode) return;
   String today = getCurrentDate(); if (today == "N/A") return;
   File file = LittleFS.open(HISTORY_FILE, "r");
-  DynamicJsonDocument doc(8192); 
+  DynamicJsonDocument doc(8192);
   if (file) { deserializeJson(doc, file); file.close(); }
   JsonObject dayData = doc[today].to<JsonObject>();
   dayData["y"] = liveData.dailyEnergy;
@@ -391,7 +372,8 @@ void updateDailySummary() {
 
 void logMinuteData() {
   if (!liveData.valid || isAPMode) return;
-  String today = getCurrentDate(); String timeNow = getCurrentTimeShort(); if (today == "N/A") return;
+  String today = getCurrentDate();
+  String timeNow = getCurrentTimeShort(); if (today == "N/A") return;
   String filename = "/" + today + ".csv";
   File file = LittleFS.open(filename, "a");
   if(file) {
@@ -422,66 +404,131 @@ void notifyClients() {
   ws.textAll(jsonBuffer);
 }
 
-// --- BLE PROVISIONING ---
-void startBLEProvisioning() {
-  Serial.println("Starting BLE WiFi provisioning...");
-  WiFi.mode(WIFI_MODE_STA);
-  WiFi.onEvent(SysProvEvent);
-  
-  const char* prov_pop = "epeverpop";
-  const char* prov_service = "PROV_EPEVER_SETUP";
-  
-  WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_NONE, NETWORK_PROV_SECURITY_1, prov_pop, prov_service);
+// --- WIFI CREDENTIAL MANAGEMENT ---
+void saveWiFiCredentials(const char* savedSSID, const char* savedPassword) {
+  DynamicJsonDocument doc(512);
+  doc["ssid"] = savedSSID;
+  doc["password"] = savedPassword;
+  File file = LittleFS.open(WIFI_CONFIG_FILE, "w");
+  if (file) { serializeJson(doc, file); file.close(); Serial.printf("WiFi saved: %s\n", savedSSID); }
 }
 
-void SysProvEvent(arduino_event_id_t event) {
-  switch(event) {
-    case ARDUINO_EVENT_PROV_START:
-      Serial.println("Provisioning Started! Please connect with the provisioning app (BLE).");
-      break;
-    case ARDUINO_EVENT_PROV_CRED_RECV:
-      Serial.println("Wi-Fi Credentials Received via BLE.");
-      break;
-    case ARDUINO_EVENT_PROV_CRED_SUCCESS:
-      Serial.println("Successfully Provisioned Wi-Fi Credentials.");
-      break;
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.print("Device Connected to Wi-Fi! IP: ");
-      Serial.println(WiFi.localIP());
-      break;
-    case ARDUINO_EVENT_PROV_END:
-      Serial.println("Provisioning process finished.");
-      break;
-    default:
-      break;
+bool loadWiFiCredentials(String &savedSSID, String &savedPassword) {
+  if (!LittleFS.exists(WIFI_CONFIG_FILE)) return false;
+  File file = LittleFS.open(WIFI_CONFIG_FILE, "r");
+  if (!file) return false;
+  DynamicJsonDocument doc(512);
+  if (deserializeJson(doc, file) != DeserializationError::Ok) { file.close(); return false; }
+  file.close();
+  if (doc.containsKey("ssid") && doc.containsKey("password")) {
+    savedSSID = doc["ssid"].as<String>();
+    savedPassword = doc["password"].as<String>();
+    return true;
   }
+  return false;
+}
+
+void connectToWiFi(const char* ssid, const char* password) {
+  Serial.printf("Connecting to WiFi: %s\n", ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); Serial.print("."); attempts++; }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    saveWiFiCredentials(ssid, password);
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    isAPMode = false;
+  } else {
+    Serial.println("Failed, starting AP mode");
+    startAPMode();
+  }
+}
+
+void startAPMode() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_pass);
+  isAPMode = true;
+  Serial.printf("AP Mode: %s | IP: %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
+}
+
+// --- OTA UPDATE FUNCTIONS (FIXED) ---
+void handleOTAUpdate(AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
+  if (!index) {
+    Serial.printf("OTA Start: %s\n", filename.c_str());
+    otaInProgress = true;
+    otaProgress = 0;
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      Update.printError(Serial);
+      request->send(400, "text/plain", "OTA Start Failed");
+      otaInProgress = false;
+      return;
+    }
+  }
+
+  if (len) {
+    if (Update.write(data, len) != len) {
+      Update.printError(Serial);
+      request->send(400, "text/plain", "OTA Write Failed");
+      otaInProgress = false;
+      return;
+    }
+    otaProgress = (index + len);
+  }
+
+  if (final) {
+    if (!Update.end(true)) {
+      Update.printError(Serial);
+      request->send(400, "text/plain", "OTA End Failed");
+      otaInProgress = false;
+      return;
+    }
+    Serial.println("OTA Complete!");
+    otaInProgress = false;
+    // Response is handled in the onRequest callback to prevent connection reset
+  }
+}
+
+void handleOTAStatus(AsyncWebServerRequest *request) {
+  StaticJsonDocument<256> doc;
+  doc["version"] = FIRMWARE_VERSION;
+  doc["date"] = FIRMWARE_DATE;
+  doc["otaInProgress"] = otaInProgress;
+  doc["otaProgress"] = otaProgress;
+  doc["chipModel"] = ESP.getChipModel();
+  doc["freeSketch"] = ESP.getFreeSketchSpace();
+  String json; serializeJson(doc, json);
+  request->send(200, "application/json", json);
 }
 
 // --- SETUP ---
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n--- SOLAR MONITOR V9.7 BOOT ---");
+  Serial.println("\n\n--- SOLAR MONITOR V9.8 BOOT ---");
 
   if(!LittleFS.begin(true)) { Serial.println("Mount Failed"); return; }
 
   pinMode(RS485_DE_RE_PIN, OUTPUT); digitalWrite(RS485_DE_RE_PIN, LOW); 
   MODBUS_SERIAL.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
+  MODBUS_SERIAL.setTimeout(1000);
   node.begin(MODBUS_SLAVE_ID, MODBUS_SERIAL);
-  node.preTransmission(preTransmission); 
+  node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
   
-  delay(500); // Let controller stabilize
+  delay(500); 
   verifyModbusConnection();
 
-  // Start BLE provisioning to accept WiFi credentials
-  Serial.println("Initializing BLE WiFi provisioning...");
-  startBLEProvisioning();
+  String savedSSID = "";
+  String savedPassword = "";
+  if (loadWiFiCredentials(savedSSID, savedPassword) && savedSSID.length() > 0) {
+    connectToWiFi(savedSSID.c_str(), savedPassword.c_str());
+  } else {
+    startAPMode();
+  }
 
   ws.onEvent(onWebSocketEvent); server.addHandler(&ws);
-  // Serve HTML directly from PROGMEM to avoid RAM copying and blank responses
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/html", index_html);
-  });
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){ request->send(200, "text/html", index_html); });
   
   server.on("/api/day-log", HTTP_GET, [](AsyncWebServerRequest *request){
     if(request->hasParam("date")) {
@@ -496,31 +543,24 @@ void setup() {
 
   server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *request){
       readEpeverSettings();
-      
-      // DIAGNOSTIC DUMP TO SERIAL
-      Serial.println("\n--- CURRENT CONTROLLER SETTINGS ---");
-      Serial.printf("Bat Type: %d | Capacity: %d | Temp Comp: %d | Rated Volt: %d\n", currentSettings.batType, currentSettings.batCap, currentSettings.tempComp, currentSettings.ratedVolt);
-      Serial.printf("OVD: %.2f | CLV: %.2f | OVR: %.2f\n", currentSettings.ovd, currentSettings.clv, currentSettings.ovr);
-      Serial.printf("EQV: %.2f | BST: %.2f | FLT: %.2f | BSR: %.2f\n", currentSettings.eqv, currentSettings.bst, currentSettings.flt, currentSettings.bsr);
-      Serial.printf("LVR: %.2f | UVR: %.2f | UVW: %.2f | LVD: %.2f | DLV: %.2f\n", currentSettings.lvr, currentSettings.uvr, currentSettings.uvw, currentSettings.lvd, currentSettings.dlv);
-      Serial.println("-----------------------------------\n");
-
       StaticJsonDocument<1280> doc; 
       doc["type"] = currentSettings.batType;
       doc["cap"] = currentSettings.batCap;
       doc["tcomp"] = currentSettings.tempComp;
-      doc["ratedVolt"] = currentSettings.ratedVolt; // ADDED
-      doc["ovd"] = currentSettings.ovd; doc["clv"] = currentSettings.clv;
+      doc["ratedVolt"] = currentSettings.ratedVolt;
+      doc["ovd"] = currentSettings.ovd;
+      doc["clv"] = currentSettings.clv;
       doc["ovr"] = currentSettings.ovr; doc["eqv"] = currentSettings.eqv;
       doc["bst"] = currentSettings.bst; doc["flt"] = currentSettings.flt;
-      doc["bsr"] = currentSettings.bsr; doc["lvr"] = currentSettings.lvr;
+      doc["bsr"] = currentSettings.bsr;
+      doc["lvr"] = currentSettings.lvr;
       doc["uvr"] = currentSettings.uvr; doc["uvw"] = currentSettings.uvw;
       doc["lvd"] = currentSettings.lvd; doc["dlv"] = currentSettings.dlv;
-      doc["eqt"] = currentSettings.eqTime; doc["bstt"] = currentSettings.bstTime;
+      doc["eqt"] = currentSettings.eqTime;
+      doc["bstt"] = currentSettings.bstTime;
       String json; serializeJson(doc, json); request->send(200, "application/json", json);
   });
 
-  // API: POST SETTINGS
   server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest *request){ }, NULL, 
   [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
       if (shouldUpdateSettings) { request->send(429, "text/plain", "Busy"); return; }
@@ -534,6 +574,67 @@ void setup() {
       request->send(200, "text/plain", "Update Queued");
   });
 
+  server.on("/api/wifi-status", HTTP_GET, [](AsyncWebServerRequest *request){
+      StaticJsonDocument<256> doc;
+      doc["isAPMode"] = isAPMode;
+      doc["wifiConnected"] = (WiFi.status() == WL_CONNECTED);
+      if (WiFi.status() == WL_CONNECTED) {
+        doc["ssid"] = WiFi.SSID();
+        doc["ip"] = WiFi.localIP().toString();
+        doc["rssi"] = WiFi.RSSI();
+      } else if (isAPMode) {
+        doc["apIP"] = WiFi.softAPIP().toString();
+        doc["apSSID"] = ap_ssid;
+      }
+      String json; serializeJson(doc, json); request->send(200, "application/json", json);
+  });
+
+  server.on("/api/wifi-connect", HTTP_POST, [](AsyncWebServerRequest *request){ }, NULL,
+  [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      StaticJsonDocument<256> doc;
+      deserializeJson(doc, data);
+      if (!doc.containsKey("ssid") || !doc.containsKey("password")) { request->send(400, "text/plain", "Missing data"); return; }
+      String newSSID = doc["ssid"].as<String>();
+      String newPassword = doc["password"].as<String>();
+      request->send(200, "text/plain", "Connecting...");
+      delay(500);
+      connectToWiFi(newSSID.c_str(), newPassword.c_str());
+  });
+
+  server.on("/api/wifi-scan", HTTP_GET, [](AsyncWebServerRequest *request){
+      int networksFound = WiFi.scanNetworks();
+      StaticJsonDocument<2048> doc;
+      JsonArray networks = doc.createNestedArray("networks");
+      for (int i = 0; i < networksFound; i++) {
+        JsonObject network = networks.createNestedObject();
+        network["ssid"] = WiFi.SSID(i);
+        network["rssi"] = WiFi.RSSI(i);
+        network["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+      }
+      String json; serializeJson(doc, json); request->send(200, "application/json", json);
+      WiFi.scanDelete();
+  });
+
+  server.on("/api/firmware-info", HTTP_GET, handleOTAStatus);
+
+  // --- OTA UPLOAD HANDLER (FIXED) ---
+  server.on("/api/firmware-update", HTTP_POST, 
+    [](AsyncWebServerRequest *request){
+      // This runs AFTER the upload is complete
+      if (Update.hasError()) {
+        request->send(500, "text/plain", "Update Failed");
+      } else {
+        AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", "Update successful. Device restarting...");
+        response->addHeader("Connection", "close");
+        request->send(response);
+        shouldReboot = true; // Trigger reboot in loop()
+      }
+    },
+    [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){
+      handleOTAUpdate(request, filename, index, data, len, final);
+    }
+  );
+
   server.begin();
 }
 
@@ -543,13 +644,28 @@ void loop() {
   ws.cleanupClients();
   unsigned long currentMillis = millis();
   
-  // BACKGROUND TASK (Non-blocking)
+  // Safe Reboot Task
+  if (shouldReboot) {
+    delay(1000);
+    ESP.restart();
+  }
+
   if (shouldUpdateSettings) {
       processSettingsUpdate();
       lastModbusUpdate = millis(); 
   }
 
-  if (!isAPMode && (WiFi.status() != WL_CONNECTED) && (currentMillis - lastWiFiCheck >= 30000)) { WiFi.disconnect(); WiFi.reconnect(); lastWiFiCheck = currentMillis; }
+  if (WiFi.status() != WL_CONNECTED && !isAPMode && (currentMillis - lastWiFiCheck >= 30000)) {
+    Serial.println("WiFi lost, reconnecting...");
+    String savedSSID = ""; String savedPassword = "";
+    if (loadWiFiCredentials(savedSSID, savedPassword) && savedSSID.length() > 0) {
+      connectToWiFi(savedSSID.c_str(), savedPassword.c_str());
+    } else { startAPMode(); }
+    lastWiFiCheck = currentMillis;
+  } else if (WiFi.status() == WL_CONNECTED && isAPMode) {
+    isAPMode = false;
+  }
+  
   if (currentMillis - lastModbusUpdate > POLLING_INTERVAL) { readLiveSensors(); notifyClients(); lastModbusUpdate = currentMillis; }
   if (currentMillis - lastMinuteLog > MINUTE_LOG_INTERVAL) { if(liveData.valid) logMinuteData(); lastMinuteLog = currentMillis; }
   if (currentMillis - lastHistorySave > HISTORY_SAVE_INTERVAL) { if(liveData.valid) updateDailySummary(); lastHistorySave = currentMillis; }
