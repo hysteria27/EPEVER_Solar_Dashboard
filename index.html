@@ -201,6 +201,54 @@ const char index_html[] PROGMEM = R"rawliteral(
                     <p class="text-center text-xs text-gray-400 mt-2">PIN Required. Improper voltages can damage batteries.</p>
                 </div>
             </div>
+
+            <!-- WiFi Configuration -->
+            <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-gray-100 dark:border-slate-800 shadow-sm">
+                <div class="flex justify-between items-center mb-6">
+                    <div><h2 class="text-xl font-bold">WiFi Configuration</h2><p class="text-gray-500 text-sm">Connect to WiFi network or manage connectivity.</p></div>
+                    <button onclick="fetchWiFiStatus()" class="text-sm text-solar-500 font-bold flex gap-1 items-center" title="Refresh WiFi status"><i data-lucide="refresh-cw" class="w-4 h-4"></i> Refresh</button>
+                </div>
+
+                <div id="wifi-status-container" class="mb-6 p-4 bg-gray-50 dark:bg-slate-800 rounded-lg border border-gray-200 dark:border-slate-700">
+                    <div class="flex items-center gap-2 mb-2">
+                        <span id="wifi-status-dot" class="inline-block w-3 h-3 rounded-full bg-gray-300"></span>
+                        <span id="wifi-status-text" class="font-semibold">Checking WiFi status...</span>
+                    </div>
+                    <p id="wifi-status-details" class="text-xs text-gray-600 dark:text-gray-400"></p>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <!-- Manual Connect -->
+                    <div class="space-y-4">
+                        <h3 class="font-bold text-gray-400 text-xs uppercase tracking-wider border-b pb-2">Manual Connection</h3>
+                        <div>
+                            <label class="text-xs font-semibold block mb-1">Network SSID</label>
+                            <input type="text" id="wifi-ssid" placeholder="Enter network name" class="w-full p-2 bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded text-xs">
+                        </div>
+                        <div>
+                            <label class="text-xs font-semibold block mb-1">Password</label>
+                            <input type="password" id="wifi-password" placeholder="Enter password" class="w-full p-2 bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded text-xs">
+                        </div>
+                        <button onclick="connectToWiFi()" class="w-full text-white bg-blue-600 hover:bg-blue-700 font-bold rounded-lg text-sm px-4 py-2 flex justify-center items-center gap-2">
+                            <i data-lucide="wifi" class="w-4 h-4"></i> Connect
+                        </button>
+                        <p id="wifi-connect-status" class="text-xs text-center text-gray-500"></p>
+                    </div>
+
+                    <!-- Available Networks -->
+                    <div class="space-y-4">
+                        <div class="flex justify-between items-center border-b pb-2">
+                            <h3 class="font-bold text-gray-400 text-xs uppercase tracking-wider">Available Networks</h3>
+                            <button onclick="scanWiFiNetworks()" class="text-xs text-solar-500 font-bold flex gap-1 items-center" title="Scan for nearby networks">
+                                <i data-lucide="search" class="w-3 h-3"></i> Scan
+                            </button>
+                        </div>
+                        <div id="wifi-networks-container" class="space-y-2 max-h-48 overflow-y-auto">
+                            <p class="text-xs text-gray-400">Click "Scan" to search for networks...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <!-- FIRMWARE VIEW -->
@@ -520,8 +568,116 @@ const char index_html[] PROGMEM = R"rawliteral(
         lucide.createIcons();
     }
 
-    // WiFi management UI and web-based connect/scan functions removed.
-    // The device continues to use saved credentials or AP fallback.
+    // --- WiFi MANAGEMENT ---
+    async function fetchWiFiStatus() {
+        try {
+            const res = await fetch('/api/wifi-status');
+            const data = await res.json();
+            
+            const statusDot = document.getElementById('wifi-status-dot');
+            const statusText = document.getElementById('wifi-status-text');
+            const statusDetails = document.getElementById('wifi-status-details');
+            
+            if (data.wifiConnected) {
+                statusDot.className = 'inline-block w-3 h-3 rounded-full bg-green-500 animate-pulse';
+                statusText.textContent = '✓ WiFi Connected';
+                statusText.className = 'font-semibold text-green-600 dark:text-green-400';
+                statusDetails.textContent = `SSID: ${data.ssid} | IP: ${data.ip} | Signal: ${data.rssi} dBm`;
+            } else if (data.isAPMode) {
+                statusDot.className = 'inline-block w-3 h-3 rounded-full bg-yellow-500 animate-pulse';
+                statusText.textContent = '⚠ AP Mode (No WiFi)';
+                statusText.className = 'font-semibold text-yellow-600 dark:text-yellow-400';
+                statusDetails.textContent = `Access Point: ${data.apSSID} | IP: ${data.apIP}`;
+            } else {
+                statusDot.className = 'inline-block w-3 h-3 rounded-full bg-red-500';
+                statusText.textContent = '✗ Disconnected';
+                statusText.className = 'font-semibold text-red-600 dark:text-red-400';
+                statusDetails.textContent = 'No connection established';
+            }
+        } catch(e) {
+            console.error('WiFi status error:', e);
+        }
+    }
+
+    async function scanWiFiNetworks() {
+        const container = document.getElementById('wifi-networks-container');
+        container.innerHTML = '<p class="text-xs text-gray-400">Scanning...</p>';
+        
+        try {
+            const res = await fetch('/api/wifi-scan');
+            const data = await res.json();
+            
+            if (!data.networks || data.networks.length === 0) {
+                container.innerHTML = '<p class="text-xs text-gray-400">No networks found</p>';
+                return;
+            }
+            
+            container.innerHTML = '';
+            data.networks.forEach(net => {
+                const signal = net.rssi > -50 ? 'Excellent' : net.rssi > -70 ? 'Good' : 'Weak';
+                const lockIcon = net.secure ? '🔒' : '🔓';
+                const item = document.createElement('div');
+                item.className = 'p-2 bg-white dark:bg-slate-700 border border-gray-200 dark:border-slate-600 rounded cursor-pointer hover:bg-gray-100 dark:hover:bg-slate-600 transition-colors';
+                item.innerHTML = `<div class="flex justify-between items-start"><div><div class="text-xs font-semibold">${lockIcon} ${net.ssid}</div><div class="text-xs text-gray-500">${signal} (${net.rssi} dBm)</div></div></div>`;
+                item.onclick = () => {
+                    document.getElementById('wifi-ssid').value = net.ssid;
+                    document.getElementById('wifi-password').focus();
+                };
+                container.appendChild(item);
+            });
+        } catch(e) {
+            console.error('Scan error:', e);
+            container.innerHTML = '<p class="text-xs text-red-500">Scan failed</p>';
+        }
+    }
+
+    async function connectToWiFi() {
+        const ssid = document.getElementById('wifi-ssid').value.trim();
+        const password = document.getElementById('wifi-password').value;
+        const statusEl = document.getElementById('wifi-connect-status');
+        
+        if (!ssid) {
+            statusEl.textContent = 'SSID required';
+            statusEl.className = 'text-xs text-center text-red-500';
+            return;
+        }
+        
+        statusEl.textContent = 'Connecting...';
+        statusEl.className = 'text-xs text-center text-blue-500';
+        
+        try {
+            const res = await fetch('/api/wifi-connect', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ssid, password })
+            });
+            
+            if (res.ok) {
+                statusEl.textContent = 'Connecting to WiFi... Please wait.';
+                statusEl.className = 'text-xs text-center text-blue-500';
+                
+                // Check connection status after 5 seconds
+                setTimeout(() => {
+                    fetchWiFiStatus();
+                    statusEl.textContent = '';
+                }, 5000);
+            } else {
+                const msg = await res.text();
+                statusEl.textContent = `Error: ${msg}`;
+                statusEl.className = 'text-xs text-center text-red-500';
+            }
+        } catch(e) {
+            statusEl.textContent = 'Connection failed';
+            statusEl.className = 'text-xs text-center text-red-500';
+            console.error(e);
+        }
+    }
+
+    // Initialize WiFi status on page load
+    window.addEventListener('load', () => {
+        fetchWiFiStatus();
+        setTimeout(() => fetchWiFiStatus(), 2000);
+    });
 
     // --- FIRMWARE MANAGEMENT ---
     let selectedFile = null;

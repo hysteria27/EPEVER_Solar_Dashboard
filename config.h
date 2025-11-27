@@ -3,4 +3,4 @@ const char* ssid = "";
 const char* password = ""; 
 
 // --- SECURITY CONFIG ---
-const char* ADMIN_PIN = ""; 
+const char* ADMIN_PIN = "1234"; 

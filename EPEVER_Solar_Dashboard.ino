@@ -13,6 +13,7 @@
 */
 
 #include <WiFi.h>
+#include <WiFiProv.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncWebSocket.h>
@@ -20,7 +21,6 @@
 #include <ModbusMaster.h>
 #include <LittleFS.h>
 #include <time.h>
-#include <Update.h>
 
 // --- INCLUDE UI & CONFIG ---
 #include "web_page.h" 
@@ -30,13 +30,6 @@
 const char* ap_ssid = "EPEVER_Direct";
 const char* ap_pass = "12345678";
 bool isAPMode = false;
-const char* WIFI_CONFIG_FILE = "/wifi_config.json";
-
-// --- FIRMWARE INFO ---
-const char* FIRMWARE_VERSION = "9.8";
-const char* FIRMWARE_DATE = "2025-11-27";
-bool otaInProgress = false;
-int otaProgress = 0;
 
 // --- TIME CONFIG ---
 const char* ntpServer = "pool.ntp.org";
@@ -429,143 +422,39 @@ void notifyClients() {
   ws.textAll(jsonBuffer);
 }
 
-// --- WIFI CREDENTIAL MANAGEMENT ---
-void saveWiFiCredentials(const char* savedSSID, const char* savedPassword) {
-  DynamicJsonDocument doc(512);
-  doc["ssid"] = savedSSID;
-  doc["password"] = savedPassword;
+// --- BLE PROVISIONING ---
+void startBLEProvisioning() {
+  Serial.println("Starting BLE WiFi provisioning...");
+  WiFi.mode(WIFI_MODE_STA);
+  WiFi.onEvent(SysProvEvent);
   
-  File file = LittleFS.open(WIFI_CONFIG_FILE, "w");
-  if (file) {
-    serializeJson(doc, file);
-    file.close();
-    Serial.printf("WiFi credentials saved: %s\n", savedSSID);
-  } else {
-    Serial.println("Failed to save WiFi credentials");
-  }
+  const char* prov_pop = "epeverpop";
+  const char* prov_service = "PROV_EPEVER_SETUP";
+  
+  WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_NONE, NETWORK_PROV_SECURITY_1, prov_pop, prov_service);
 }
 
-bool loadWiFiCredentials(String &savedSSID, String &savedPassword) {
-  if (!LittleFS.exists(WIFI_CONFIG_FILE)) {
-    Serial.println("No saved WiFi credentials found");
-    return false;
+void SysProvEvent(arduino_event_id_t event) {
+  switch(event) {
+    case ARDUINO_EVENT_PROV_START:
+      Serial.println("Provisioning Started! Please connect with the provisioning app (BLE).");
+      break;
+    case ARDUINO_EVENT_PROV_CRED_RECV:
+      Serial.println("Wi-Fi Credentials Received via BLE.");
+      break;
+    case ARDUINO_EVENT_PROV_CRED_SUCCESS:
+      Serial.println("Successfully Provisioned Wi-Fi Credentials.");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.print("Device Connected to Wi-Fi! IP: ");
+      Serial.println(WiFi.localIP());
+      break;
+    case ARDUINO_EVENT_PROV_END:
+      Serial.println("Provisioning process finished.");
+      break;
+    default:
+      break;
   }
-  
-  File file = LittleFS.open(WIFI_CONFIG_FILE, "r");
-  if (!file) return false;
-  
-  DynamicJsonDocument doc(512);
-  if (deserializeJson(doc, file) != DeserializationError::Ok) {
-    file.close();
-    return false;
-  }
-  file.close();
-  
-  if (doc.containsKey("ssid") && doc.containsKey("password")) {
-    savedSSID = doc["ssid"].as<String>();
-    savedPassword = doc["password"].as<String>();
-    Serial.printf("Loaded WiFi credentials: %s\n", savedSSID.c_str());
-    return true;
-  }
-  
-  return false;
-}
-
-void connectToWiFi(const char* ssid, const char* password) {
-  Serial.printf("Attempting to connect to WiFi: %s\n", ssid);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  Serial.println();
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("WiFi Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-    saveWiFiCredentials(ssid, password);
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    isAPMode = false;
-    return;
-  }
-  
-  Serial.println("WiFi connection failed, starting AP mode");
-  startAPMode();
-}
-
-void startAPMode() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(ap_ssid, ap_pass);
-  isAPMode = true;
-  Serial.printf("AP Mode Started: %s | IP: %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
-}
-
-// --- OTA UPDATE FUNCTIONS ---
-void handleOTAUpdate(AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
-  if (!index) {
-    Serial.printf("OTA Update Start: filename=%s\n", filename.c_str());
-    otaInProgress = true;
-    otaProgress = 0;
-    
-    // Check if we can begin OTA
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
-      Serial.println("OTA: Cannot begin update");
-      Update.printError(Serial);
-      request->send(400, "text/plain", "Cannot start OTA update");
-      otaInProgress = false;
-      return;
-    }
-  }
-
-  // Write data to flash
-  if (len) {
-    if (Update.write(data, len) != len) {
-      Serial.println("OTA: Write failed");
-      Update.printError(Serial);
-      request->send(400, "text/plain", "OTA write failed");
-      otaInProgress = false;
-      return;
-    }
-    otaProgress = (index + len);
-    Serial.printf("OTA Progress: %d bytes\n", otaProgress);
-  }
-
-  // Finalize update
-  if (final) {
-    if (!Update.end(true)) {
-      Serial.println("OTA: End failed");
-      Update.printError(Serial);
-      request->send(400, "text/plain", "OTA finalization failed");
-      otaInProgress = false;
-      return;
-    }
-    
-    Serial.println("OTA Update Complete! Restarting...");
-    request->send(200, "text/plain", "Update successful. Device restarting...");
-    
-    // Restart after a brief delay to send response
-    delay(1000);
-    ESP.restart();
-  }
-}
-
-void handleOTAStatus(AsyncWebServerRequest *request) {
-  StaticJsonDocument<256> doc;
-  doc["version"] = FIRMWARE_VERSION;
-  doc["date"] = FIRMWARE_DATE;
-  doc["otaInProgress"] = otaInProgress;
-  doc["otaProgress"] = otaProgress;
-  doc["chipModel"] = ESP.getChipModel();
-  doc["chipRevision"] = ESP.getChipRevision();
-  doc["flashSize"] = ESP.getFlashChipSize();
-  doc["freeSketch"] = ESP.getFreeSketchSpace();
-  
-  String json;
-  serializeJson(doc, json);
-  request->send(200, "application/json", json);
 }
 
 // --- SETUP ---
@@ -578,28 +467,21 @@ void setup() {
   pinMode(RS485_DE_RE_PIN, OUTPUT); digitalWrite(RS485_DE_RE_PIN, LOW); 
   MODBUS_SERIAL.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
   node.begin(MODBUS_SLAVE_ID, MODBUS_SERIAL);
-  node.setReadTimeout(1000); // 1000ms timeout for responses
   node.preTransmission(preTransmission); 
   node.postTransmission(postTransmission);
   
   delay(500); // Let controller stabilize
   verifyModbusConnection();
 
-  // --- WIFI INITIALIZATION ---
-  String savedSSID = "";
-  String savedPassword = "";
-  bool credentialsLoaded = loadWiFiCredentials(savedSSID, savedPassword);
-  
-  if (credentialsLoaded && savedSSID.length() > 0) {
-    connectToWiFi(savedSSID.c_str(), savedPassword.c_str());
-  } else {
-    // No saved credentials, start in AP mode
-    Serial.println("No saved WiFi credentials, starting in AP mode");
-    startAPMode();
-  }
+  // Start BLE provisioning to accept WiFi credentials
+  Serial.println("Initializing BLE WiFi provisioning...");
+  startBLEProvisioning();
 
   ws.onEvent(onWebSocketEvent); server.addHandler(&ws);
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){ String html = index_html; request->send(200, "text/html", html); });
+  // Serve HTML directly from PROGMEM to avoid RAM copying and blank responses
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
   
   server.on("/api/day-log", HTTP_GET, [](AsyncWebServerRequest *request){
     if(request->hasParam("date")) {
@@ -652,80 +534,6 @@ void setup() {
       request->send(200, "text/plain", "Update Queued");
   });
 
-  // API: WiFi Configuration - GET current WiFi status
-  server.on("/api/wifi-status", HTTP_GET, [](AsyncWebServerRequest *request){
-      StaticJsonDocument<256> doc;
-      doc["isAPMode"] = isAPMode;
-      doc["wifiConnected"] = (WiFi.status() == WL_CONNECTED);
-      if (WiFi.status() == WL_CONNECTED) {
-        doc["ssid"] = WiFi.SSID();
-        doc["ip"] = WiFi.localIP().toString();
-        doc["rssi"] = WiFi.RSSI();
-      } else if (isAPMode) {
-        doc["apIP"] = WiFi.softAPIP().toString();
-        doc["apSSID"] = ap_ssid;
-      }
-      String json;
-      serializeJson(doc, json);
-      request->send(200, "application/json", json);
-  });
-
-  // API: WiFi Configuration - POST to save and connect
-  server.on("/api/wifi-connect", HTTP_POST, [](AsyncWebServerRequest *request){ }, NULL,
-  [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-      StaticJsonDocument<256> doc;
-      DeserializationError err = deserializeJson(doc, data);
-      
-      if (err || !doc.containsKey("ssid") || !doc.containsKey("password")) {
-          request->send(400, "text/plain", "Missing SSID or password");
-          return;
-      }
-      
-      String newSSID = doc["ssid"].as<String>();
-      String newPassword = doc["password"].as<String>();
-      
-      if (newSSID.length() == 0) {
-          request->send(400, "text/plain", "SSID cannot be empty");
-          return;
-      }
-      
-      request->send(200, "text/plain", "Connecting...");
-      
-      // Connect in background
-      delay(500);
-      connectToWiFi(newSSID.c_str(), newPassword.c_str());
-  });
-
-  // API: WiFi Configuration - GET available networks (WiFi scan)
-  server.on("/api/wifi-scan", HTTP_GET, [](AsyncWebServerRequest *request){
-      int networksFound = WiFi.scanNetworks();
-      StaticJsonDocument<2048> doc;
-      JsonArray networks = doc.createNestedArray("networks");
-      
-      for (int i = 0; i < networksFound; i++) {
-        JsonObject network = networks.createNestedObject();
-        network["ssid"] = WiFi.SSID(i);
-        network["rssi"] = WiFi.RSSI(i);
-        network["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
-      }
-      
-      String json;
-      serializeJson(doc, json);
-      request->send(200, "application/json", json);
-      WiFi.scanDelete();
-  });
-
-  // API: OTA Firmware Update Status
-  server.on("/api/firmware-info", HTTP_GET, handleOTAStatus);
-
-  // API: OTA Firmware Update Upload
-  server.on("/api/firmware-update", HTTP_POST, 
-    [](AsyncWebServerRequest *request){ },
-    [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){
-      handleOTAUpdate(request, filename, index, data, len, final);
-    }
-  );
-
   server.begin();
 }
 
@@ -741,25 +549,7 @@ void loop() {
       lastModbusUpdate = millis(); 
   }
 
-  // WiFi Management: Check connection status and handle fallback/reconnect
-  if (WiFi.status() != WL_CONNECTED && !isAPMode && (currentMillis - lastWiFiCheck >= 30000)) {
-    // Try to reconnect if we were previously in station mode
-    Serial.println("WiFi connection lost, attempting reconnection...");
-    String savedSSID = "";
-    String savedPassword = "";
-    if (loadWiFiCredentials(savedSSID, savedPassword) && savedSSID.length() > 0) {
-      connectToWiFi(savedSSID.c_str(), savedPassword.c_str());
-    } else {
-      startAPMode();
-    }
-    lastWiFiCheck = currentMillis;
-  } else if (WiFi.status() == WL_CONNECTED && isAPMode) {
-    // Successfully reconnected, exit AP mode
-    Serial.println("WiFi reconnected, exiting AP mode");
-    isAPMode = false;
-  }
-  
-  // Modbus polling (only when data is valid)
+  if (!isAPMode && (WiFi.status() != WL_CONNECTED) && (currentMillis - lastWiFiCheck >= 30000)) { WiFi.disconnect(); WiFi.reconnect(); lastWiFiCheck = currentMillis; }
   if (currentMillis - lastModbusUpdate > POLLING_INTERVAL) { readLiveSensors(); notifyClients(); lastModbusUpdate = currentMillis; }
   if (currentMillis - lastMinuteLog > MINUTE_LOG_INTERVAL) { if(liveData.valid) logMinuteData(); lastMinuteLog = currentMillis; }
   if (currentMillis - lastHistorySave > HISTORY_SAVE_INTERVAL) { if(liveData.valid) updateDailySummary(); lastHistorySave = currentMillis; }
