@@ -18,6 +18,15 @@ const int BUTTON_PIN = 0; // GPIO 0 is the "BOOT" button on most dev boards
 unsigned long last_ip_print = 0;
 const long ip_print_interval = 5000; // 5 seconds
 
+// --- NEW: Non-Blocking Button State (long-press) ---
+// Tracks press start time, debounce and whether the button was held long enough
+unsigned long buttonPressStart = 0;
+const unsigned long buttonHoldTime = 3000; // ms required to trigger reset
+bool buttonWasPressed = false;
+unsigned long lastButtonChange = 0;
+const unsigned long buttonDebounce = 50; // ms debounce
+int lastButtonState = HIGH;
+
 // --- Setup ---
 
 void setup() {
@@ -60,31 +69,42 @@ void loop() {
   }
 
   // --- NEW: Check for Reset Button ---
-  // Check if the button is pressed (LOW)
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    Serial.println("Button pressed. Hold for 3 seconds to clear Wi-Fi...");
-    
-    // Wait 3 seconds
-    delay(3000); 
+  // --- NEW: Non-blocking check for Reset Button (long-press) ---
+  int currentButtonState = digitalRead(BUTTON_PIN);
+  unsigned long now = millis();
 
-    // Check if the button is STILL pressed
-    if (digitalRead(BUTTON_PIN) == LOW) {
-      Serial.println("Clearing Wi-Fi credentials and restarting...");
-
-      // Tell Wi-Fi to disconnect and, most importantly,
-      // erase the saved credentials from NVS (Non-Volatile Storage)
-      WiFi.disconnect(true, true); 
-      
-      delay(1000);
-      ESP.restart(); // Restart the ESP32
-    } else {
-      Serial.println("Button released. Reset cancelled.");
-    }
+  // Debounce: update last change timestamp when state differs
+  if (currentButtonState != lastButtonState) {
+    lastButtonChange = now;
+    lastButtonState = currentButtonState;
   }
 
-  // We add a small delay to prevent the loop from running too fast
-  // and spamming the button check, but it's short enough to be responsive.
-  delay(100);
+  // Only act on stable state after debounce period
+  if ((now - lastButtonChange) > buttonDebounce) {
+    if (currentButtonState == LOW) { // pressed
+      if (!buttonWasPressed) {
+        buttonWasPressed = true;
+        buttonPressStart = now;
+        Serial.println("Button pressed. Hold for 3 seconds to clear Wi-Fi...");
+      } else {
+        // already pressed — check hold duration
+        if ((now - buttonPressStart) >= buttonHoldTime) {
+          Serial.println("Clearing Wi-Fi credentials and restarting...");
+          // Erase saved credentials and restart immediately
+          WiFi.disconnect(true, true);
+          ESP.restart();
+        }
+      }
+    } else { // released
+      if (buttonWasPressed) {
+        // Released before hold time — cancel
+        if ((now - buttonPressStart) < buttonHoldTime) {
+          Serial.println("Button released. Reset cancelled.");
+        }
+        buttonWasPressed = false;
+      }
+    }
+  }
 }
 
 // --- Event Handler Function ---
