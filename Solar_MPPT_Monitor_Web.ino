@@ -20,6 +20,7 @@
 #include <ModbusMaster.h>
 #include <LittleFS.h>
 #include <time.h>
+#include <Update.h>
 
 // --- INCLUDE UI & CONFIG ---
 #include "web_page.h" 
@@ -30,6 +31,12 @@ const char* ap_ssid = "EPEVER_Direct";
 const char* ap_pass = "12345678";
 bool isAPMode = false;
 const char* WIFI_CONFIG_FILE = "/wifi_config.json";
+
+// --- FIRMWARE INFO ---
+const char* FIRMWARE_VERSION = "9.8";
+const char* FIRMWARE_DATE = "2025-11-27";
+bool otaInProgress = false;
+int otaProgress = 0;
 
 // --- TIME CONFIG ---
 const char* ntpServer = "pool.ntp.org";
@@ -496,6 +503,71 @@ void startAPMode() {
   Serial.printf("AP Mode Started: %s | IP: %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
 }
 
+// --- OTA UPDATE FUNCTIONS ---
+void handleOTAUpdate(AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
+  if (!index) {
+    Serial.printf("OTA Update Start: filename=%s\n", filename.c_str());
+    otaInProgress = true;
+    otaProgress = 0;
+    
+    // Check if we can begin OTA
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      Serial.println("OTA: Cannot begin update");
+      Update.printError(Serial);
+      request->send(400, "text/plain", "Cannot start OTA update");
+      otaInProgress = false;
+      return;
+    }
+  }
+
+  // Write data to flash
+  if (len) {
+    if (Update.write(data, len) != len) {
+      Serial.println("OTA: Write failed");
+      Update.printError(Serial);
+      request->send(400, "text/plain", "OTA write failed");
+      otaInProgress = false;
+      return;
+    }
+    otaProgress = (index + len);
+    Serial.printf("OTA Progress: %d bytes\n", otaProgress);
+  }
+
+  // Finalize update
+  if (final) {
+    if (!Update.end(true)) {
+      Serial.println("OTA: End failed");
+      Update.printError(Serial);
+      request->send(400, "text/plain", "OTA finalization failed");
+      otaInProgress = false;
+      return;
+    }
+    
+    Serial.println("OTA Update Complete! Restarting...");
+    request->send(200, "text/plain", "Update successful. Device restarting...");
+    
+    // Restart after a brief delay to send response
+    delay(1000);
+    ESP.restart();
+  }
+}
+
+void handleOTAStatus(AsyncWebServerRequest *request) {
+  StaticJsonDocument<256> doc;
+  doc["version"] = FIRMWARE_VERSION;
+  doc["date"] = FIRMWARE_DATE;
+  doc["otaInProgress"] = otaInProgress;
+  doc["otaProgress"] = otaProgress;
+  doc["chipModel"] = ESP.getChipModel();
+  doc["chipRevision"] = ESP.getChipRevision();
+  doc["flashSize"] = ESP.getFlashChipSize();
+  doc["freeSketch"] = ESP.getFreeSketchSpace();
+  
+  String json;
+  serializeJson(doc, json);
+  request->send(200, "application/json", json);
+}
+
 // --- SETUP ---
 void setup() {
   Serial.begin(115200);
@@ -642,6 +714,17 @@ void setup() {
       request->send(200, "application/json", json);
       WiFi.scanDelete();
   });
+
+  // API: OTA Firmware Update Status
+  server.on("/api/firmware-info", HTTP_GET, handleOTAStatus);
+
+  // API: OTA Firmware Update Upload
+  server.on("/api/firmware-update", HTTP_POST, 
+    [](AsyncWebServerRequest *request){ },
+    [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){
+      handleOTAUpdate(request, filename, index, data, len, final);
+    }
+  );
 
   server.begin();
 }

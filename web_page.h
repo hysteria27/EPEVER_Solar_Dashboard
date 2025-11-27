@@ -45,6 +45,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <button onclick="switchView('dashboard')" id="btn-dashboard" class="px-4 py-2 rounded-md text-sm font-medium flex gap-2 items-center transition-all"><i data-lucide="layout-dashboard" class="w-4 h-4"></i> Live</button>
                 <button onclick="switchView('history')" id="btn-history" class="px-4 py-2 rounded-md text-sm font-medium flex gap-2 items-center transition-all"><i data-lucide="calendar-clock" class="w-4 h-4"></i> Log</button>
                 <button onclick="switchView('settings')" id="btn-settings" class="px-4 py-2 rounded-md text-sm font-medium flex gap-2 items-center transition-all"><i data-lucide="settings" class="w-4 h-4"></i> Settings</button>
+                <button onclick="switchView('firmware')" id="btn-firmware" class="px-4 py-2 rounded-md text-sm font-medium flex gap-2 items-center transition-all"><i data-lucide="package" class="w-4 h-4"></i> Firmware</button>
             </div>
             <button onclick="toggleTheme()" class="absolute top-6 right-6 md:static p-2 rounded-full hover:bg-gray-200 dark:hover:bg-slate-800 transition-colors"><i id="theme-icon" data-lucide="moon" class="w-5 h-5"></i></button>
         </header>
@@ -249,6 +250,77 @@ const char index_html[] PROGMEM = R"rawliteral(
                 </div>
             </div>
         </div>
+
+        <!-- FIRMWARE VIEW -->
+        <div id="view-firmware" class="hidden-view fade-in space-y-6">
+            <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-gray-100 dark:border-slate-800 shadow-sm">
+                <div class="flex justify-between items-center mb-6">
+                    <div><h2 class="text-xl font-bold">Firmware Update</h2><p class="text-gray-500 text-sm">Update device firmware over-the-air (OTA).</p></div>
+                    <button onclick="fetchFirmwareInfo()" class="text-sm text-solar-500 font-bold flex gap-1 items-center" title="Refresh firmware info"><i data-lucide="refresh-cw" class="w-4 h-4"></i> Refresh</button>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <!-- Current Firmware Info -->
+                    <div class="space-y-4">
+                        <h3 class="font-bold text-gray-400 text-xs uppercase tracking-wider border-b pb-2">System Information</h3>
+                        <div class="space-y-3 text-sm">
+                            <div class="flex justify-between">
+                                <span class="text-gray-500">Firmware Version:</span>
+                                <span id="fw-version" class="font-semibold">--</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-500">Build Date:</span>
+                                <span id="fw-date" class="font-semibold">--</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-500">Chip Model:</span>
+                                <span id="fw-chip" class="font-semibold text-xs">--</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-500">Free Flash Space:</span>
+                                <span id="fw-free" class="font-semibold text-xs">--</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- OTA Upload -->
+                    <div class="lg:col-span-2 space-y-4">
+                        <h3 class="font-bold text-gray-400 text-xs uppercase tracking-wider border-b pb-2">Upload New Firmware</h3>
+                        <div class="p-4 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg text-xs text-blue-700 dark:text-blue-300">
+                            <p><strong>Instructions:</strong></p>
+                            <ol class="list-decimal list-inside mt-2 space-y-1">
+                                <li>Build the project in Arduino IDE</li>
+                                <li>Locate the compiled <code>.bin</code> file (Sketch → Export compiled Binary)</li>
+                                <li>Select the file below and upload</li>
+                                <li>Device will restart automatically after update</li>
+                            </ol>
+                        </div>
+
+                        <div class="border-2 border-dashed border-gray-300 dark:border-slate-700 rounded-lg p-6 text-center hover:bg-gray-50 dark:hover:bg-slate-800 transition-colors cursor-pointer" id="upload-dropzone">
+                            <i data-lucide="cloud-upload" class="w-8 h-8 mx-auto text-gray-400 mb-2"></i>
+                            <p class="text-sm font-semibold mb-1">Drag and drop .bin file</p>
+                            <p class="text-xs text-gray-500">or click to browse</p>
+                            <input type="file" id="fw-file-input" accept=".bin" class="hidden" onchange="handleFileSelect(event)">
+                        </div>
+
+                        <div id="fw-upload-status" class="p-3 bg-gray-50 dark:bg-slate-800 rounded-lg text-sm hidden">
+                            <div class="flex justify-between mb-2">
+                                <span>Upload Progress:</span>
+                                <span id="fw-progress-text">0%</span>
+                            </div>
+                            <div class="w-full bg-gray-200 dark:bg-slate-700 h-2 rounded-full overflow-hidden">
+                                <div id="fw-progress-bar" class="bg-solar-500 h-full" style="width: 0%"></div>
+                            </div>
+                        </div>
+
+                        <button id="fw-upload-btn" onclick="uploadFirmware()" class="w-full text-white bg-solar-600 hover:bg-solar-700 font-bold rounded-lg text-sm px-4 py-3 flex justify-center items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+                            <i data-lucide="upload-cloud" class="w-4 h-4"></i> Upload Firmware
+                        </button>
+                        <p id="fw-message" class="text-xs text-center text-gray-500"></p>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
 <script>
@@ -381,11 +453,14 @@ const char index_html[] PROGMEM = R"rawliteral(
         document.getElementById('view-dashboard').className = id==='dashboard'?'fade-in space-y-6':'hidden-view';
         document.getElementById('view-history').className = id==='history'?'fade-in space-y-6':'hidden-view';
         document.getElementById('view-settings').className = id==='settings'?'fade-in space-y-6':'hidden-view';
+        document.getElementById('view-firmware').className = id==='firmware'?'fade-in space-y-6':'hidden-view';
         if(id==='settings') fetchSettings();
+        if(id==='firmware') fetchFirmwareInfo();
         const inactive="text-gray-600 dark:text-gray-300", active="bg-solar-500 text-white shadow-md";
         document.getElementById('btn-dashboard').className = "px-4 py-2 rounded-md text-sm font-medium transition-all flex gap-2 items-center " + (id==='dashboard'?active:inactive);
         document.getElementById('btn-history').className = "px-4 py-2 rounded-md text-sm font-medium transition-all flex gap-2 items-center " + (id==='history'?active:inactive);
         document.getElementById('btn-settings').className = "px-4 py-2 rounded-md text-sm font-medium transition-all flex gap-2 items-center " + (id==='settings'?active:inactive);
+        document.getElementById('btn-firmware').className = "px-4 py-2 rounded-md text-sm font-medium transition-all flex gap-2 items-center " + (id==='firmware'?active:inactive);
     }
     
     function downloadLog() {
@@ -603,6 +678,142 @@ const char index_html[] PROGMEM = R"rawliteral(
         fetchWiFiStatus();
         setTimeout(() => fetchWiFiStatus(), 2000);
     });
+
+    // --- FIRMWARE MANAGEMENT ---
+    let selectedFile = null;
+
+    async function fetchFirmwareInfo() {
+        try {
+            const res = await fetch('/api/firmware-info');
+            const data = await res.json();
+            
+            document.getElementById('fw-version').textContent = data.version || '--';
+            document.getElementById('fw-date').textContent = data.date || '--';
+            document.getElementById('fw-chip').textContent = `${data.chipModel} (Rev ${data.chipRevision})`;
+            document.getElementById('fw-free').textContent = `${(data.freeSketch / 1024 / 1024).toFixed(2)} MB`;
+        } catch(e) {
+            console.error('Firmware info error:', e);
+        }
+    }
+
+    document.getElementById('upload-dropzone')?.addEventListener('click', () => {
+        document.getElementById('fw-file-input').click();
+    });
+
+    document.getElementById('upload-dropzone')?.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        document.getElementById('upload-dropzone').classList.add('bg-gray-100', 'dark:bg-slate-700');
+    });
+
+    document.getElementById('upload-dropzone')?.addEventListener('dragleave', () => {
+        document.getElementById('upload-dropzone').classList.remove('bg-gray-100', 'dark:bg-slate-700');
+    });
+
+    document.getElementById('upload-dropzone')?.addEventListener('drop', (e) => {
+        e.preventDefault();
+        document.getElementById('upload-dropzone').classList.remove('bg-gray-100', 'dark:bg-slate-700');
+        
+        if (e.dataTransfer.files.length > 0) {
+            const file = e.dataTransfer.files[0];
+            if (file.name.endsWith('.bin')) {
+                selectedFile = file;
+                document.getElementById('fw-message').textContent = `Selected: ${file.name}`;
+                document.getElementById('fw-message').className = 'text-xs text-center text-green-600 dark:text-green-400';
+            } else {
+                document.getElementById('fw-message').textContent = 'Please drop a .bin file';
+                document.getElementById('fw-message').className = 'text-xs text-center text-red-600';
+            }
+        }
+    });
+
+    function handleFileSelect(event) {
+        const file = event.target.files[0];
+        if (file && file.name.endsWith('.bin')) {
+            selectedFile = file;
+            document.getElementById('fw-message').textContent = `Selected: ${file.name}`;
+            document.getElementById('fw-message').className = 'text-xs text-center text-green-600 dark:text-green-400';
+        } else {
+            document.getElementById('fw-message').textContent = 'Invalid file. Please select a .bin file';
+            document.getElementById('fw-message').className = 'text-xs text-center text-red-600';
+            selectedFile = null;
+        }
+    }
+
+    async function uploadFirmware() {
+        if (!selectedFile) {
+            document.getElementById('fw-message').textContent = 'Please select a firmware file first';
+            document.getElementById('fw-message').className = 'text-xs text-center text-red-600';
+            return;
+        }
+
+        const btn = document.getElementById('fw-upload-btn');
+        const status = document.getElementById('fw-upload-status');
+        const msg = document.getElementById('fw-message');
+        
+        btn.disabled = true;
+        status.classList.remove('hidden');
+        msg.textContent = 'Uploading...';
+        msg.className = 'text-xs text-center text-blue-600';
+
+        try {
+            const formData = new FormData();
+            formData.append('firmware', selectedFile);
+
+            const xhr = new XMLHttpRequest();
+            
+            xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable) {
+                    const percentComplete = (e.loaded / e.total) * 100;
+                    document.getElementById('fw-progress-bar').style.width = percentComplete + '%';
+                    document.getElementById('fw-progress-text').textContent = Math.round(percentComplete) + '%';
+                }
+            });
+
+            xhr.addEventListener('load', () => {
+                if (xhr.status === 200) {
+                    msg.textContent = 'Upload successful! Device restarting...';
+                    msg.className = 'text-xs text-center text-green-600 dark:text-green-400';
+                    selectedFile = null;
+                    document.getElementById('fw-file-input').value = '';
+                    
+                    // Reset UI after delay
+                    setTimeout(() => {
+                        status.classList.add('hidden');
+                        document.getElementById('fw-progress-bar').style.width = '0%';
+                        document.getElementById('fw-progress-text').textContent = '0%';
+                        btn.disabled = false;
+                        msg.textContent = '';
+                    }, 3000);
+                } else {
+                    msg.textContent = 'Upload failed: ' + xhr.responseText;
+                    msg.className = 'text-xs text-center text-red-600';
+                    btn.disabled = false;
+                }
+            });
+
+            xhr.addEventListener('error', () => {
+                msg.textContent = 'Upload error. Device may be restarting...';
+                msg.className = 'text-xs text-center text-yellow-600';
+                btn.disabled = false;
+                
+                // Try to reconnect after device restart
+                setTimeout(() => {
+                    fetchFirmwareInfo();
+                    status.classList.add('hidden');
+                    document.getElementById('fw-progress-bar').style.width = '0%';
+                    document.getElementById('fw-progress-text').textContent = '0%';
+                    msg.textContent = 'Device may have restarted. Check Firmware tab.';
+                }, 5000);
+            });
+
+            xhr.open('POST', '/api/firmware-update');
+            xhr.send(formData);
+        } catch(e) {
+            msg.textContent = 'Error: ' + e.message;
+            msg.className = 'text-xs text-center text-red-600';
+            btn.disabled = false;
+        }
+    }
 </script>
 </body>
 </html>
