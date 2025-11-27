@@ -29,6 +29,7 @@
 const char* ap_ssid = "EPEVER_Direct";
 const char* ap_pass = "12345678";
 bool isAPMode = false;
+const char* WIFI_CONFIG_FILE = "/wifi_config.json";
 
 // --- TIME CONFIG ---
 const char* ntpServer = "pool.ntp.org";
@@ -421,6 +422,80 @@ void notifyClients() {
   ws.textAll(jsonBuffer);
 }
 
+// --- WIFI CREDENTIAL MANAGEMENT ---
+void saveWiFiCredentials(const char* savedSSID, const char* savedPassword) {
+  DynamicJsonDocument doc(512);
+  doc["ssid"] = savedSSID;
+  doc["password"] = savedPassword;
+  
+  File file = LittleFS.open(WIFI_CONFIG_FILE, "w");
+  if (file) {
+    serializeJson(doc, file);
+    file.close();
+    Serial.printf("WiFi credentials saved: %s\n", savedSSID);
+  } else {
+    Serial.println("Failed to save WiFi credentials");
+  }
+}
+
+bool loadWiFiCredentials(String &savedSSID, String &savedPassword) {
+  if (!LittleFS.exists(WIFI_CONFIG_FILE)) {
+    Serial.println("No saved WiFi credentials found");
+    return false;
+  }
+  
+  File file = LittleFS.open(WIFI_CONFIG_FILE, "r");
+  if (!file) return false;
+  
+  DynamicJsonDocument doc(512);
+  if (deserializeJson(doc, file) != DeserializationError::Ok) {
+    file.close();
+    return false;
+  }
+  file.close();
+  
+  if (doc.containsKey("ssid") && doc.containsKey("password")) {
+    savedSSID = doc["ssid"].as<String>();
+    savedPassword = doc["password"].as<String>();
+    Serial.printf("Loaded WiFi credentials: %s\n", savedSSID.c_str());
+    return true;
+  }
+  
+  return false;
+}
+
+void connectToWiFi(const char* ssid, const char* password) {
+  Serial.printf("Attempting to connect to WiFi: %s\n", ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("WiFi Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    saveWiFiCredentials(ssid, password);
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    isAPMode = false;
+    return;
+  }
+  
+  Serial.println("WiFi connection failed, starting AP mode");
+  startAPMode();
+}
+
+void startAPMode() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_pass);
+  isAPMode = true;
+  Serial.printf("AP Mode Started: %s | IP: %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
+}
+
 // --- SETUP ---
 void setup() {
   Serial.begin(115200);
@@ -438,15 +513,17 @@ void setup() {
   delay(500); // Let controller stabilize
   verifyModbusConnection();
 
-  WiFi.mode(WIFI_STA); WiFi.begin(ssid, password);
-  int attempts = 0; while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); attempts++; }
+  // --- WIFI INITIALIZATION ---
+  String savedSSID = "";
+  String savedPassword = "";
+  bool credentialsLoaded = loadWiFiCredentials(savedSSID, savedPassword);
   
-  if(WiFi.status() == WL_CONNECTED) { 
-    Serial.println("WiFi Connected");
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer); 
-    isAPMode = false; 
-  } else { 
-    WiFi.mode(WIFI_AP); WiFi.softAP(ap_ssid, ap_pass); isAPMode = true; 
+  if (credentialsLoaded && savedSSID.length() > 0) {
+    connectToWiFi(savedSSID.c_str(), savedPassword.c_str());
+  } else {
+    // No saved credentials, start in AP mode
+    Serial.println("No saved WiFi credentials, starting in AP mode");
+    startAPMode();
   }
 
   ws.onEvent(onWebSocketEvent); server.addHandler(&ws);
@@ -503,6 +580,69 @@ void setup() {
       request->send(200, "text/plain", "Update Queued");
   });
 
+  // API: WiFi Configuration - GET current WiFi status
+  server.on("/api/wifi-status", HTTP_GET, [](AsyncWebServerRequest *request){
+      StaticJsonDocument<256> doc;
+      doc["isAPMode"] = isAPMode;
+      doc["wifiConnected"] = (WiFi.status() == WL_CONNECTED);
+      if (WiFi.status() == WL_CONNECTED) {
+        doc["ssid"] = WiFi.SSID();
+        doc["ip"] = WiFi.localIP().toString();
+        doc["rssi"] = WiFi.RSSI();
+      } else if (isAPMode) {
+        doc["apIP"] = WiFi.softAPIP().toString();
+        doc["apSSID"] = ap_ssid;
+      }
+      String json;
+      serializeJson(doc, json);
+      request->send(200, "application/json", json);
+  });
+
+  // API: WiFi Configuration - POST to save and connect
+  server.on("/api/wifi-connect", HTTP_POST, [](AsyncWebServerRequest *request){ }, NULL,
+  [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      StaticJsonDocument<256> doc;
+      DeserializationError err = deserializeJson(doc, data);
+      
+      if (err || !doc.containsKey("ssid") || !doc.containsKey("password")) {
+          request->send(400, "text/plain", "Missing SSID or password");
+          return;
+      }
+      
+      String newSSID = doc["ssid"].as<String>();
+      String newPassword = doc["password"].as<String>();
+      
+      if (newSSID.length() == 0) {
+          request->send(400, "text/plain", "SSID cannot be empty");
+          return;
+      }
+      
+      request->send(200, "text/plain", "Connecting...");
+      
+      // Connect in background
+      delay(500);
+      connectToWiFi(newSSID.c_str(), newPassword.c_str());
+  });
+
+  // API: WiFi Configuration - GET available networks (WiFi scan)
+  server.on("/api/wifi-scan", HTTP_GET, [](AsyncWebServerRequest *request){
+      int networksFound = WiFi.scanNetworks();
+      StaticJsonDocument<2048> doc;
+      JsonArray networks = doc.createNestedArray("networks");
+      
+      for (int i = 0; i < networksFound; i++) {
+        JsonObject network = networks.createNestedObject();
+        network["ssid"] = WiFi.SSID(i);
+        network["rssi"] = WiFi.RSSI(i);
+        network["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+      }
+      
+      String json;
+      serializeJson(doc, json);
+      request->send(200, "application/json", json);
+      WiFi.scanDelete();
+  });
+
   server.begin();
 }
 
@@ -518,7 +658,25 @@ void loop() {
       lastModbusUpdate = millis(); 
   }
 
-  if (!isAPMode && (WiFi.status() != WL_CONNECTED) && (currentMillis - lastWiFiCheck >= 30000)) { WiFi.disconnect(); WiFi.reconnect(); lastWiFiCheck = currentMillis; }
+  // WiFi Management: Check connection status and handle fallback/reconnect
+  if (WiFi.status() != WL_CONNECTED && !isAPMode && (currentMillis - lastWiFiCheck >= 30000)) {
+    // Try to reconnect if we were previously in station mode
+    Serial.println("WiFi connection lost, attempting reconnection...");
+    String savedSSID = "";
+    String savedPassword = "";
+    if (loadWiFiCredentials(savedSSID, savedPassword) && savedSSID.length() > 0) {
+      connectToWiFi(savedSSID.c_str(), savedPassword.c_str());
+    } else {
+      startAPMode();
+    }
+    lastWiFiCheck = currentMillis;
+  } else if (WiFi.status() == WL_CONNECTED && isAPMode) {
+    // Successfully reconnected, exit AP mode
+    Serial.println("WiFi reconnected, exiting AP mode");
+    isAPMode = false;
+  }
+  
+  // Modbus polling (only when data is valid)
   if (currentMillis - lastModbusUpdate > POLLING_INTERVAL) { readLiveSensors(); notifyClients(); lastModbusUpdate = currentMillis; }
   if (currentMillis - lastMinuteLog > MINUTE_LOG_INTERVAL) { if(liveData.valid) logMinuteData(); lastMinuteLog = currentMillis; }
   if (currentMillis - lastHistorySave > HISTORY_SAVE_INTERVAL) { if(liveData.valid) updateDailySummary(); lastHistorySave = currentMillis; }
